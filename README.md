@@ -1,10 +1,8 @@
 # EKS Demo
 
 ## Requirements
-- EKS cluster created with public and private subnets
-  - cluster configured for Fargate as per https://docs.aws.amazon.com/eks/latest/userguide/fargate-getting-started.html
 - ECR instance created
-- AWS Profile Configured
+- AWS Profile Configured for CLI access in `.aws/credentials`
 - bash shell/docker (can use Cloud9 IDE)
 
 ## Build and Push Docker
@@ -37,6 +35,15 @@ docker push $DEMO_ECR:demo
 - **Docker Image Name**: `$DEMO_ECR:demo`
 - **Image Container Port**: `80`
 
+## Build Fargate Cluster
+The sample file [`cluster.yaml`](cluster/cluster.yaml) deploys a Fargate-only cluster into an existing VPC.  If you want to create a VPC dedicated to EKS, delete the entire `vpc:` section, otherwise you need to customize with data from your existing VPCs.
+
+`--profile` is required if you need to use something other than the default.  At the time of this writing, `eksctl` requires credentials to be specified in the `.aws/credentials` file, it doesn't work with `aws sso login`.
+
+```
+eksctl create cluster -f cluster/cluster.yaml --profile AWSAdministratorAccess-123456789012
+```
+
 ## Deploy Pod To EKS
 ### Configure kubectl
 you need to know cluster name use `aws eks list-clusters` to find it
@@ -46,14 +53,6 @@ EKS_CLUSTER=$(aws eks --region us-east-1 --profile AWSAdministratorAccess-332670
 aws eks --region us-east-1 --profile AWSAdministratorAccess-332670553932 update-kubeconfig --name $EKS_CLUSTER
 kubectl create namespace demo
 ```
-
-
-### Create Fargate Profile for `demo` namespace
-https://docs.aws.amazon.com/eks/latest/userguide/fargate-getting-started.html#fargate-gs-create-profile
-
-Select only private subnets and use namespace `demo`
-
-
 ### Create Deployment File
 this will config the standard template
 ```
@@ -87,24 +86,28 @@ fargate-ip-10-100-94-30.ec2.internal   Ready    <none>   13m   v1.18.8-eks-7c9bd
 Get the INTERNAL-IP values from above you should be able to invoke `http://10.100.44.1:80/` AND `http://10.100.94.30:80/`.  This address will be on a private subnet so use Cloud9 IDE or a bastion EC2
 
 ## Load Balancer
+Please see the [AWS Documentation](https://docs.aws.amazon.com/eks/latest/userguide/alb-ingress.html) for requirements.
+### High-level checklist
+1. Tag the subnets appropriately `kubernetes.io/role/{internal-}elb`
+2. Create the IAM service account with appropriate permissions to manage ELBs
+3. Deploy the `alb-load-balancer-controller`
 
-For ALB on Fargate, you need to install the `alb-ingress-controller`
-
+### Create Service Account
 ```
 cd alb-controller
-ALB_POLICY=$(aws iam create-policy --policy-name AWSLoadBalancerControllerPolicy2 --policy-document file://iam-policy.json --query 'Policy.Arn' --output text)
+ALB_POLICY=$(aws iam create-policy --policy-name AWSLoadBalancerControllerPolicy --policy-document file://iam-policy.json --query 'Policy.Arn' --output text)
 OIDC_PROVIDER=$(aws eks describe-cluster --name $EKS_CLUSTER --query "cluster.identity.oidc.issuer" --output text | sed -e "s/^https:\/\///")
 sed 's/AWS_ACCOUNT_ID/'$AWS_ACCOUNT_ID'/' trust-policy.tmpl | sed 's@OIDC_PROVIDER@'$OIDC_PROVIDER'@' > trust.json
-ALB_ROLE=$(aws iam create-role --role-name eksAlbRole --assume-role-policy-document file://trust.json --description "Role for EKS Load Balancer Controller" --query 'Role.Arn' --output text)
-aws iam attach-role-policy --role-name eksAlbRole --policy-arn=$ALB_POLICY
-kubectl create serviceaccount -n kube-system aws-load-balancer-controller
-kubectl annotate serviceaccount -n kube-system aws-load-balancer-controller eks.amazonaws.com/role-arn=$ALB_ROLE
+eksctl create iamserviceaccount --cluster=aam-cluster --namespace=kube-system --name=aws-load-balancer-controller --attach-policy-arn=$ALB_POLICY --override-existing-serviceaccounts --approve
 ```
 
+### Install Load Balancer Controller
+
+Note the region and vpc id need to be included here!
 ```
 kubectl apply -k "github.com/aws/eks-charts/stable/aws-load-balancer-controller//crds?ref=master"
 helm repo add eks https://aws.github.io/eks-charts
-helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller   --set clusterName=$EKS_CLUSTER   --set serviceAccount.create=false   --set serviceAccount.name=aws-load-balancer-controller -n kube-system
+helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller   --set clusterName=$EKS_CLUSTER   --set serviceAccount.create=false   --set region=<REGION> --set vpc=<VPC>--set serviceAccount.name=aws-load-balancer-controller -n kube-system
 ```
 
 
@@ -153,10 +156,3 @@ Events:
 
 ### Troubleshooting
 https://aws.amazon.com/premiumsupport/knowledge-center/eks-load-balancers-troubleshooting/
-
-helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
-  --set clusterName=$EKS_CLUSTER \
-  --set serviceAccount.create=false \
-  --set serviceAccount.name=aws-load-balancer-controller \
-  --set image.repository=918309763551.dkr.ecr.cn-north-1.amazonaws.com.cn/amazon/aws-load-balancer-controller \
-  -n kube-system
